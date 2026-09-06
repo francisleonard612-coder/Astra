@@ -44,7 +44,7 @@ async def execute_decision(client: DerivClient, decision: Decision, currency: st
     # trade on stale contract information (spec section 18).
     age_check_start = time.time()
     fresh_quote = await get_quote(client, decision.symbol, contract_type, barrier, decision.stake,
-                                   duration, duration_unit, currency)
+                                   duration, duration_unit, currency, bypass_cache=True)
     if fresh_quote is None:
         return TradeResult(decision.symbol, contract_type, barrier, decision.stake, 0.0, None, None, None,
                             error="quote_unavailable_at_execution")
