@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import signal
+from collections import Counter
 from dataclasses import dataclass
 
 import numpy as np
@@ -40,6 +41,17 @@ PREDICTION_LOG_SAMPLE_EVERY_N = 20   # log a NO_TRADE prediction row this often,
 STATE_SNAPSHOT_EVERY_N_TICKS = 200
 MODEL_PERF_LOG_EVERY_N_TICKS = 500
 BALANCE_REFRESH_EVERY_N_TICKS = 200
+# Why: the *reason* a decision was NO_TRADE only ever went to
+# astra_predictions in Supabase -- diagnosing "why hasn't it traded yet"
+# meant querying the DB directly, with nothing visible in the container
+# logs themselves. This surfaces the same information as a periodic
+# stdout summary so a long NO_TRADE stretch is diagnosable from the logs
+# alone: which abstention/mispricing reason is actually the bottleneck
+# (e.g. persistently poor calibration vs. simply no edge existing yet),
+# and, since a bad-but-not-crashing edge/regime computation could silently
+# make trading impossible forever, the last-seen edge/quality/regime
+# snapshot to distinguish "no edge yet" from "something is stuck".
+NO_TRADE_REASON_SUMMARY_EVERY_N_TICKS = 150
 
 
 @dataclass
@@ -64,6 +76,9 @@ async def symbol_worker(symbol: str, client: DerivClient, state_manager: StateMa
 
     log = get_logger("app.symbol_worker", symbol=symbol)
     log.info("Worker started")
+
+    no_trade_reason_counts: Counter = Counter()
+    last_decision_snapshot: dict | None = None
 
     while True:
         tick = await queue.get()
@@ -94,6 +109,24 @@ async def symbol_worker(symbol: str, client: DerivClient, state_manager: StateMa
 
         should_log_prediction = decision.decision != "NO_TRADE" or tick_count % PREDICTION_LOG_SAMPLE_EVERY_N == 0
         prediction_id = repo.insert_prediction(decision) if should_log_prediction else None
+
+        if decision.decision == "NO_TRADE":
+            for reason in decision.reason.split(","):
+                no_trade_reason_counts[reason] += 1
+        last_decision_snapshot = {
+            "decision": decision.decision, "regime": decision.regime,
+            "over_edge": decision.over_edge, "under_edge": decision.under_edge,
+            "quality_score": decision.quality_score,
+            "calibration_over": decision.calibration_quality.get("over"),
+            "calibration_under": decision.calibration_quality.get("under"),
+        }
+        if tick_count % NO_TRADE_REASON_SUMMARY_EVERY_N_TICKS == 0:
+            log.info("NO_TRADE reason summary (last window)", extra={"extra_fields": {
+                "window_ticks": NO_TRADE_REASON_SUMMARY_EVERY_N_TICKS,
+                "top_reasons": no_trade_reason_counts.most_common(5),
+                "last_decision": last_decision_snapshot,
+            }})
+            no_trade_reason_counts.clear()
 
         if decision.decision != "NO_TRADE" and risk_ok:
             log.info("Executing trade", extra={"extra_fields": {
