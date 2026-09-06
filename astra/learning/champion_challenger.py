@@ -57,15 +57,21 @@ class ChampionChallengerManager:
 
         champ, chall = champ[-n:], chall[-n:]
         mid = n // 2
-        champ_loss = statistics.mean(champ)
-        chall_loss = statistics.mean(chall)
+        champ_loss = float(statistics.mean(champ))
+        chall_loss = float(statistics.mean(chall))
         improvement = champ_loss - chall_loss  # positive == challenger better
 
         half1_improve = statistics.mean(champ[:mid]) - statistics.mean(chall[:mid]) if mid > 0 else 0.0
         half2_improve = statistics.mean(champ[mid:]) - statistics.mean(chall[mid:]) if (n - mid) > 0 else 0.0
-        stable = half1_improve > 0 and half2_improve > 0
-
-        promote = improvement >= self.min_improvement and stable
+        # bool(...) matters here, not just style: Python's `and` returns
+        # whichever operand decided the result rather than coercing to a
+        # native bool, so if either comparison ever produces a numpy.bool_
+        # (e.g. from a numpy-typed operand upstream), `stable`/`promote`
+        # would silently inherit that numpy type. numpy.bool_ isn't JSON
+        # serializable, and this exact chain previously crashed every write
+        # to astra_champion_challenger.
+        stable = bool(half1_improve > 0 and half2_improve > 0)
+        promote = bool(improvement >= self.min_improvement and stable)
 
         self.experiment_log.record(
             symbol=symbol,
