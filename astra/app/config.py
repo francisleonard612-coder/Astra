@@ -41,10 +41,38 @@ def _env_int(name: str, default: int) -> int:
 class DerivConfig:
     app_id: str = field(default_factory=lambda: os.getenv("DERIV_APP_ID", "1089"))
     api_token: str = field(default_factory=lambda: os.getenv("DERIV_API_TOKEN", ""))
-    ws_url: str = field(default_factory=lambda: os.getenv("DERIV_WS_URL", "wss://ws.derivws.com/websockets/v3"))
+    # Legacy WS host, only used as a last-resort fallback if Deriv's OTP response
+    # ever omits the ready-to-use websocket URL (see DerivClient._exchange_otp).
+    ws_url: str = field(default_factory=lambda: os.getenv("DERIV_WS_URL", "wss://api.derivws.com/trading/v1/options/ws/demo"))
+    # REST API base URL. DerivClient appends /trading/v1/options/accounts[...]
+    # itself, so this should just be the host -- do not include a path.
     options_token_url: str = field(
-        default_factory=lambda: os.getenv("DERIV_OPTIONS_TOKEN_URL", "https://api.derivws.com/trading/v1/options")
+        default_factory=lambda: os.getenv("DERIV_OPTIONS_TOKEN_URL", "https://api.derivws.com")
     )
+    # Optional: pin a specific Options account id (e.g. "DOT90004580") instead of
+    # letting DerivClient auto-resolve one from GET /accounts. Leave unset to
+    # auto-resolve based on use_real_account below.
+    account_id: str | None = field(default_factory=lambda: os.getenv("DERIV_ACCOUNT_ID", "").strip() or None)
+    # Which account type to auto-resolve to when account_id is unset.
+    # False (default) = demo. True = real money. This is independent of
+    # DRY_RUN (see AstraConfig.dry_run below) -- the two combine as:
+    #   use_real=False, dry_run=True  -> nothing hits Deriv's buy endpoint;
+    #                                     safest option, good for a first
+    #                                     smoke test of signals/connectivity.
+    #   use_real=False, dry_run=False -> trades actually execute through
+    #                                     Deriv's real proposal/buy/settlement
+    #                                     path, but against a demo account's
+    #                                     play balance. This is "paper trading
+    #                                     that exercises the real order flow",
+    #                                     not a local simulation -- the
+    #                                     recommended way to validate the bot
+    #                                     end-to-end before risking money.
+    #   use_real=True,  dry_run=False -> live, real-money trading.
+    #   use_real=True,  dry_run=True  -> connects to the real account but
+    #                                     never places an order; mostly
+    #                                     useful for checking real-account
+    #                                     balance/symbol access without risk.
+    use_real_account: bool = field(default_factory=lambda: _env_bool("DERIV_USE_REAL", False))
 
 
 @dataclass
@@ -95,6 +123,8 @@ class AstraConfig:
         self.raw["risk"]["staking"]["progression_factor"] = self.risk_overrides.martingale_factor
         self.raw["risk"]["staking"]["max_steps"] = self.risk_overrides.martingale_max_steps
 
+        # See DerivConfig.use_real_account docstring above for how this
+        # combines with account type to give four distinct modes.
         self.dry_run: bool = _env_bool("DRY_RUN", False)
         self.currency: str = os.getenv("CURRENCY", "USD")
         self.log_level: str = os.getenv("LOG_LEVEL", self.raw.get("logging", {}).get("level", "INFO"))

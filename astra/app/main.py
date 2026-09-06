@@ -160,7 +160,17 @@ async def seed_symbol(client: DerivClient, state_manager: StateManager, symbol: 
 async def main() -> None:
     cfg = get_config()
     configure_logging(cfg.log_level)
-    logger.info("Starting Astra", extra={"extra_fields": {"dry_run": cfg.dry_run}})
+    account_kind = "REAL MONEY" if cfg.deriv.use_real_account else "demo"
+    logger.info("Starting Astra", extra={"extra_fields": {
+        "dry_run": cfg.dry_run, "account_kind": account_kind,
+    }})
+    if cfg.deriv.use_real_account and cfg.dry_run:
+        logger.warning("use_real_account=True with dry_run=True: connecting to the REAL account "
+                        "but no orders will be placed.")
+    elif cfg.deriv.use_real_account:
+        logger.warning("use_real_account=True: this run trades REAL MONEY.")
+    else:
+        logger.info(f"Trading against the DEMO account (dry_run={cfg.dry_run}).")
 
     supabase = make_supabase_client(cfg.supabase.url, cfg.supabase.service_key, cfg.supabase.enabled)
     repo = Repository(supabase, persist_ticks=cfg.get("database", "persist_ticks", default=True))
@@ -168,6 +178,7 @@ async def main() -> None:
     client = DerivClient(
         app_id=cfg.deriv.app_id, api_token=cfg.deriv.api_token,
         ws_url=cfg.deriv.ws_url, options_token_url=cfg.deriv.options_token_url,
+        account_id=cfg.deriv.account_id, use_real_account=cfg.deriv.use_real_account,
     )
     await client.connect()
     repo.insert_system_event("app.main", "startup")

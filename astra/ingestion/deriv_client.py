@@ -9,6 +9,17 @@ Two hard lessons from earlier bots in this account are baked in here:
    401s at handshake time on this account before; the OTP exchange sidesteps
    that entirely.
 
+   Current Deriv REST flow (as of the account-scoped Options API):
+     - GET  {base}/trading/v1/options/accounts
+           headers: Deriv-App-ID, Authorization: Bearer <token>
+           -> list of accounts; we auto-pick one (see _resolve_account_id)
+     - POST {base}/trading/v1/options/accounts/{accountId}/otp
+           headers: Deriv-App-ID, Authorization: Bearer <token>
+           (no JSON body)
+           -> {"data": {"url": "wss://.../ws/demo?otp=..."}}
+     - The OTP is valid for 120s and single-use, so the WS connection is
+       opened immediately after the exchange.
+
 2. NO INLINE AWAITS IN THE RECV LOOP: `_recv_pump` is the only coroutine that
    reads off the socket. If it ever `await`s a tick handler directly, and that
    handler calls something like `proposal()` or `buy()` which needs to read a
@@ -60,11 +71,20 @@ class Tick:
 
 class DerivClient:
     def __init__(self, app_id: str, api_token: str, ws_url: str, options_token_url: str,
+                 account_id: str | None = None, use_real_account: bool = False,
                  request_timeout: float = 15.0):
         self.app_id = app_id
         self.api_token = api_token
-        self.ws_url = ws_url
-        self.options_token_url = options_token_url
+        self.ws_url = ws_url  # unused by the current REST-OTP flow; kept only as a legacy fallback
+        self.api_base_url = options_token_url.rstrip("/")
+        self.account_id = account_id or None  # if unset, auto-resolved on first connect()
+        # Which kind of account to auto-resolve to when account_id isn't pinned.
+        # False (default) -> demo: trades place for real on Deriv's platform,
+        # go through the exact same proposal/buy/settlement path as real
+        # money, but settle against a demo account's play balance. This is
+        # a materially different (and safer) thing than DRY_RUN, which never
+        # calls buy() at all -- see app/config.py DRY_RUN docs.
+        self.use_real_account = use_real_account
         self.request_timeout = request_timeout
 
         self._ws: websockets.WebSocketClientProtocol | None = None
@@ -82,28 +102,86 @@ class DerivClient:
     # ------------------------------------------------------------------ #
     async def connect(self) -> None:
         async with self._connect_lock:
-            auth_url = await self._exchange_otp()
+            if not self.account_id:
+                self.account_id = await self._resolve_account_id()
+                logger.info("Auto-resolved Deriv account", extra={"extra_fields": {
+                    "event_type": "account_resolved", "account_id": self.account_id,
+                    "wanted": "real" if self.use_real_account else "demo",
+                }})
+            auth_url = await self._exchange_otp(self.account_id)
             self._ws = await websockets.connect(auth_url, ping_interval=20, ping_timeout=20, close_timeout=5)
             self._closed = False
             self._recv_task = asyncio.create_task(self._recv_pump(), name="deriv-recv-pump")
             logger.info("Connected to Deriv", extra={"extra_fields": {"event_type": "ws_connected"}})
 
-    async def _exchange_otp(self) -> str:
-        """Exchange the long-lived API token for a pre-authenticated WS URL."""
+    def _auth_headers(self) -> dict:
+        return {"Deriv-App-ID": self.app_id, "Authorization": f"Bearer {self.api_token}"}
+
+    async def _resolve_account_id(self) -> str:
+        """Fetch the caller's Options accounts and pick one matching
+        `self.use_real_account` (demo by default -- see __init__).
+
+        Field-matching logic mirrors a separately-built and live-tested
+        Deriv bot's account resolver rather than guessing at the schema:
+        checks both `type` and `account_type` (whichever the response
+        actually uses) against "real"/"demo", case-insensitively. If no
+        account of the wanted kind is found, falls back to the first
+        account returned and logs a warning -- better to trade on the
+        wrong-but-visible account than silently fail to start.
+        """
         if not self.api_token:
             raise DerivAuthError("DERIV_API_TOKEN is not set")
-        params = {"app_id": self.app_id, "api_token": self.api_token}
+        url = f"{self.api_base_url}/trading/v1/options/accounts"
         async with httpx.AsyncClient(timeout=15.0) as client:
-            resp = await client.post(self.options_token_url, json=params)
+            resp = await client.get(url, headers=self._auth_headers())
+        if resp.status_code != 200:
+            raise DerivAuthError(f"Fetching accounts failed: HTTP {resp.status_code} {resp.text[:300]}")
+        body = resp.json()
+        accounts = body.get("data") or body.get("accounts") or (body if isinstance(body, list) else [])
+        if not accounts:
+            raise DerivAuthError(f"No Options accounts returned for this token: {body}")
+
+        wanted = "real" if self.use_real_account else "demo"
+        for acc in accounts:
+            acc_type = str(acc.get("type") or acc.get("account_type") or "").lower()
+            if acc_type == wanted:
+                account_id = acc.get("account_id") or acc.get("id")
+                if account_id:
+                    return account_id
+
+        first = accounts[0]
+        account_id = first.get("account_id") or first.get("id")
+        if not account_id:
+            raise DerivAuthError(f"Account entry had no id field: {first}")
+        logger.warning(f"No '{wanted}' account found, falling back to first returned account",
+                        extra={"extra_fields": {
+                            "event_type": "account_type_mismatch",
+                            "wanted": wanted, "fallback_account_id": account_id,
+                        }})
+        return account_id
+
+    async def _exchange_otp(self, account_id: str) -> str:
+        """Exchange the long-lived API token for a pre-authenticated WS URL.
+
+        OTP is valid for 120s and single-use, so the caller must open the
+        WebSocket connection immediately after this returns.
+        """
+        if not self.api_token:
+            raise DerivAuthError("DERIV_API_TOKEN is not set")
+        url = f"{self.api_base_url}/trading/v1/options/accounts/{account_id}/otp"
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url, headers=self._auth_headers())
         if resp.status_code != 200:
             raise DerivAuthError(f"OTP token exchange failed: HTTP {resp.status_code} {resp.text[:300]}")
-        data = resp.json()
-        auth_url = data.get("websocket_url") or data.get("ws_url") or data.get("url")
+        body = resp.json()
+        data = body.get("data", body)
+        auth_url = data.get("url") or data.get("websocket_url") or data.get("ws_url")
         if not auth_url:
-            # Fall back: some deployments return the OTP itself rather than a full URL.
+            # Fall back for older/legacy deployments that return a bare OTP instead
+            # of a ready-to-use URL.
             otp = data.get("otp") or data.get("token")
             if not otp:
-                raise DerivAuthError(f"OTP exchange response had no usable URL/token: {data}")
+                raise DerivAuthError(f"OTP exchange response had no usable URL/token: {body}")
             auth_url = f"{self.ws_url}?app_id={self.app_id}&otp={otp}"
         return auth_url
 
@@ -217,12 +295,15 @@ class DerivClient:
     # Public API
     # ------------------------------------------------------------------ #
     async def get_active_synthetic_symbols(self, prefixes: list[str]) -> list[str]:
-        resp = await self._send({"active_symbols": "brief", "product_type": "basic"})
+        # "product_type" was removed from the request in Deriv's current
+        # (non-legacy) Options API -- sending it causes a validation error.
+        resp = await self._send({"active_symbols": "brief"})
         symbols = []
         for s in resp.get("active_symbols", []):
             if s.get("market") != "synthetic_index":
                 continue
-            code = s.get("symbol", "")
+            # Response field renamed: "symbol" -> "underlying_symbol".
+            code = s.get("underlying_symbol", "")
             if any(code.startswith(p) for p in prefixes):
                 symbols.append(code)
         return sorted(set(symbols))
@@ -264,7 +345,10 @@ class DerivClient:
             "basis": "stake",
             "contract_type": contract_type,
             "currency": currency,
-            "symbol": symbol,
+            # Request field renamed: "symbol" -> "underlying_symbol" in
+            # Deriv's current (non-legacy) Options API. Sending "symbol"
+            # returns InputValidationFailed: Properties not allowed: symbol.
+            "underlying_symbol": symbol,
             "duration": duration,
             "duration_unit": duration_unit,
             "barrier": str(barrier),
