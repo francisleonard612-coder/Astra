@@ -132,8 +132,18 @@ class SymbolPipeline:
             challenger_vec = combine(predictions, self.performance.current_weights())
             p_champ = float(np.clip(champion_vec[actual_digit], 1e-9, 1.0))
             p_chall = float(np.clip(challenger_vec[actual_digit], 1e-9, 1.0))
-            self._ensemble_logloss_champion.append(-np.log(p_champ))
-            self._ensemble_logloss_challenger.append(-np.log(p_chall))
+            # np.log() on a native float still returns numpy.float64 -- cast
+            # back to a native float immediately so nothing downstream (in
+            # particular learning/champion_challenger.py's stable/promote
+            # booleans, computed via comparisons on values derived from
+            # these deques) can inherit a numpy dtype. numpy.float64 happens
+            # to serialize to JSON fine (it subclasses float), but a
+            # numpy.bool_ produced downstream from a numpy-typed comparison
+            # does not, and previously crashed every Supabase write to
+            # astra_champion_challenger with "Object of type bool is not
+            # JSON serializable".
+            self._ensemble_logloss_champion.append(float(-np.log(p_champ)))
+            self._ensemble_logloss_challenger.append(float(-np.log(p_chall)))
 
         if self._pending_over_prob is not None:
             outcome_over = 1 if actual_digit > over_barrier else 0
