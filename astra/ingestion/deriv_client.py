@@ -44,6 +44,7 @@ from typing import Any, Callable, Awaitable
 
 import httpx
 import websockets
+from websockets.protocol import State as WsState
 
 from app.logging_setup import get_logger
 
@@ -195,7 +196,14 @@ class DerivClient:
             await self._ws.close()
 
     async def ensure_connected(self) -> None:
-        if self._ws is None or self._ws.closed:
+        # websockets 14+ replaced the old boolean `.closed` property on the
+        # connection object with a `.state` enum (websockets.protocol.State).
+        # `.closed` doesn't exist on the ClientConnection this version returns
+        # -- checking it raised AttributeError on every call and crashed the
+        # bot right after every successful connect (see incident log:
+        # "'ClientConnection' object has no attribute 'closed'").
+        is_open = self._ws is not None and self._ws.state is WsState.OPEN
+        if not is_open:
             logger.warning("Reconnecting to Deriv", extra={"extra_fields": {"event_type": "ws_reconnect"}})
             await self.connect()
             # re-subscribe any symbols we were watching
