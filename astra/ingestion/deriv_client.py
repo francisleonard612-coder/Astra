@@ -58,6 +58,42 @@ class DerivAuthError(RuntimeError):
 class DerivRequestError(RuntimeError):
     def __init__(self, message: str, code: str | None = None, raw: dict | None = None):
         super().__init__(message)
+
+
+class _RateLimiter:
+    """Sliding-window limiter for Deriv's shared per-connection budget.
+
+    Deriv's docs (developers.deriv.com/docs/limits) count proposal,
+    proposal_open_contract, buy, and sell against ONE shared budget of 360
+    requests/minute per connection -- not 360 each. With several symbol
+    workers sharing a single DerivClient/connection, each calling
+    get_proposal() roughly once per tick, that budget was being blown
+    through in seconds (observed: dozens of concurrent "You have reached
+    the rate limit for proposal" errors within the same second).
+
+    This waits BEFORE sending rather than firing and handling the 429-style
+    error after the fact, per Deriv's own "pace your bursts" guidance --
+    cheaper than round-tripping a doomed request and matches how the
+    proposal cache (see pricing/payout.py) already avoids most of this
+    traffic in the first place.
+    """
+    def __init__(self, max_per_window: int, window_seconds: float = 60.0):
+        self.max_per_window = max_per_window
+        self.window_seconds = window_seconds
+        self._timestamps: list[float] = []
+        self._lock = asyncio.Lock()
+
+    async def acquire(self) -> None:
+        async with self._lock:
+            while True:
+                now = time.monotonic()
+                cutoff = now - self.window_seconds
+                self._timestamps = [t for t in self._timestamps if t > cutoff]
+                if len(self._timestamps) < self.max_per_window:
+                    self._timestamps.append(now)
+                    return
+                sleep_for = self._timestamps[0] - cutoff
+                await asyncio.sleep(max(sleep_for, 0.05))
         self.code = code
         self.raw = raw or {}
 
@@ -87,6 +123,13 @@ class DerivClient:
         # calls buy() at all -- see app/config.py DRY_RUN docs.
         self.use_real_account = use_real_account
         self.request_timeout = request_timeout
+        # Deriv's documented shared budget for {proposal, proposal_open_contract,
+        # buy, sell} is 360/min per connection -- capped lower here (300) to
+        # leave headroom for buy/sell/proposal_open_contract calls that share
+        # the same budget outside of get_proposal()'s own traffic.
+        self._quote_rate_limiter = _RateLimiter(max_per_window=300, window_seconds=60.0)
+        _RATE_LIMITED_KEYS = {"proposal", "proposal_open_contract", "buy", "sell"}
+        self._rate_limited_keys = _RATE_LIMITED_KEYS
 
         self._ws: websockets.WebSocketClientProtocol | None = None
         self._req_id_counter = itertools.count(1)
@@ -221,6 +264,8 @@ class DerivClient:
     # ------------------------------------------------------------------ #
     async def _send(self, payload: dict) -> dict:
         """Send a request and await its matching response. Never called from _recv_pump."""
+        if self._rate_limited_keys.intersection(payload.keys()):
+            await self._quote_rate_limiter.acquire()
         await self.ensure_connected()
         req_id = next(self._req_id_counter)
         payload = {**payload, "req_id": req_id}
