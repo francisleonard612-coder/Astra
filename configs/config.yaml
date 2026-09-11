@@ -1,0 +1,151 @@
+# Astra configuration
+# Values here are defaults; most can be overridden via environment variables
+# (see app/config.py for the mapping). Edit freely per-deployment.
+
+symbols:
+  # Astra discovers symbols dynamically from Deriv's active_symbols call.
+  # ASTRA_SYMBOLS (see .env.example) currently pins trading to 1HZ10V and
+  # 1HZ100V specifically -- clear that env var to fall back to trading
+  # every synthetic index whose underlying symbol starts with one of these
+  # prefixes, so adding more symbols later is a config change, not a code
+  # change.
+  prefixes: ["R_", "1HZ"]
+  refresh_seconds: 3600
+
+contracts:
+  duration: 1
+  duration_unit: "t"          # ticks -- LEGACY, digit-only; unused since the Rise/Fall pivot
+  over_barrier: 2             # LEGACY, digit-only
+  under_barrier: 7            # LEGACY, digit-only
+
+  # Rise/Fall candidate durations for the Monte Carlo duration selector
+  # (pricing/monte_carlo_duration.py) to rank, spanning both ticks and
+  # minutes -- wired in via decision/rise_fall_decision_engine.py. These
+  # defaults are a starting point only and have NOT been cross-checked
+  # against a live `contracts_for` response yet (see
+  # pricing/duration_grid.py's filter_to_allowed(), built but not yet
+  # called from app/main.py) -- Deriv's real min/max duration per (symbol,
+  # contract_type) varies and can change server-side. Verify against a demo
+  # account before trusting these blindly in production.
+  rise_fall:
+    candidate_tick_durations: [5, 10, 15, 20, 30]
+    candidate_minute_durations: [1, 2, 3, 5, 10]
+
+# Rise/Fall trade sizing and gating (decision/rise_fall_decision_engine.py).
+# base_stake here is READ DIRECTLY as the flat per-trade stake -- see that
+# module's own "STAKE SIZING WARNING" docstring for why this must stay a
+# fixed value, never balance * percentage (a documented real incident in
+# the ported source material: a balance-scaled stake and the risk
+# allocator's independent sizing disagreed by 527x, caught only by a hard
+# ceiling).
+rise_fall:
+  base_stake: 1.0
+  min_edge: 0.03
+  min_calibration_samples: 200
+  mc_simulations: 5000
+  # See decision/rise_fall_decision_engine.py's "MULTIPLE-COMPARISONS
+  # WARNING": evaluate() checks 4 candidates per cycle and takes the best
+  # edge, which measurably inflates the false-positive rate above what
+  # min_edge alone implies for a single comparison (measured: ~50% of pure-
+  # noise histories with fairly-priced quotes still produced a "trade" at
+  # min_edge=0.03). Re-measure against real return data, and consider
+  # raising min_edge and/or min_calibration_samples, before trusting these
+  # defaults in production.
+
+feature_windows: [20, 50, 100, 250, 500, 1000, 2500]
+max_markov_order: 3
+min_samples_per_symbol: 300      # minimum digits observed before Astra will predict at all
+
+risk:
+  base_stake: 1.0
+  max_stake: 5.0
+  max_consecutive_losses: 5
+  max_daily_loss: 25.0
+  max_drawdown: 40.0
+  max_trades_per_day: 500
+  max_concurrent_trades: 2         # hard cap on simultaneously OPEN (unsettled) contracts, across all symbols
+  cooldown_seconds_after_max_losses: 900
+  staking:
+    enabled: false                 # LEGACY, digit-only (risk/staking.py) -- Rise/Fall uses rise_fall.base_stake
+                                    # directly as a flat stake instead, see that section's own comment for why
+    progression_factor: 2.0
+    max_steps: 3
+
+database:
+  supabase_enabled: true
+  persist_ticks: true
+  tick_retention_hours: 48        # older raw ticks get pruned; rolling stats persist independently
+
+logging:
+  level: "INFO"
+
+# --- Everything below this line is LEGACY: read only by the digit-trading
+# code (decision/decision_engine.py, learning/architecture_competition.py,
+# models/digit_specialist.py, learning/champion_challenger.py, etc.), which
+# app/main.py no longer imports or runs since the Rise/Fall pivot. Left in
+# place rather than deleted in case any of it is revisited later, but none
+# of it affects a live run today.
+
+ensemble:
+  # starting weights; the ensemble learns/updates these online per symbol
+  # from rolling log-loss performance (see learning/online.py)
+  initial_weights:
+    uniform: 0.05
+    rolling_frequency: 0.15
+    ewma_frequency: 0.10
+    bayesian: 0.15
+    markov: 0.20
+    logistic: 0.10
+    random_forest: 0.10
+    xgboost: 0.15
+  min_weight: 0.02
+  performance_window: 500       # observations used for rolling log-loss weighting
+
+calibration:
+  method: "isotonic"           # isotonic | platt | none
+  min_samples_to_calibrate: 200
+  refit_every: 100
+
+regime:
+  entropy_high: 0.985           # normalized entropy above this -> HIGH_ENTROPY
+  entropy_low: 0.90             # normalized entropy below this -> LOW_ENTROPY / CONCENTRATED
+  chi_square_p_shift: 0.01      # p-value below this on recent-vs-baseline chi-square -> DISTRIBUTION_SHIFT
+  model_agreement_unstable: 0.12  # stdev of per-model P(target) above this -> MODEL_DISAGREEMENT
+  min_window_for_regime: 200
+
+mispricing:
+  minimum_edge: 0.03
+  minimum_probability: 0.55
+  minimum_calibration_score: 0.6
+  minimum_model_agreement: 0.6      # 1 - normalized stdev; higher = more agreement
+  minimum_sample_size: 300
+  minimum_quality_score: 65
+  allow_low_confidence_regimes: false
+
+retraining:
+  batch_model_every_n_observations: 300   # random_forest / xgboost refit cadence per symbol
+  min_observations_for_batch_models: 500
+
+champion_challenger:
+  evaluate_every_n_trades: 40
+  min_trades_to_evaluate: 40
+  min_improvement: 0.01          # required rolling log-loss improvement to promote
+  min_ev_no_worse_than: -0.0     # challenger EV must not be materially worse
+
+architecture_competition:
+  # How often (in scored ticks, per symbol) to re-evaluate which of the
+  # three architectures (global | specialist | hybrid) should be champion.
+  evaluate_every_n_ticks: 200
+  min_samples_for_evaluation: 200   # each architecture needs at least this many scored ticks before it's eligible to be compared
+  min_promotion_margin: 0.03        # composite score margin required to switch champion (avoids flapping on noise)
+  # Weights for the 7-metric composite score. Each metric is min-max
+  # normalized across the 3 architectures (direction-corrected so higher is
+  # always better after normalization) before these weights are applied.
+  composite_weights:
+    log_loss: 0.20
+    brier: 0.15
+    calibration: 0.20
+    stability: 0.05
+    agreement: 0.10
+    economic_ev: 0.15
+    realized_pnl: 0.15
